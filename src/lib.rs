@@ -1,7 +1,48 @@
+use anyhow::Result as AnyResult;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, error::Error, fmt};
+use std::{collections::HashMap, error::Error, fmt, fs, time::Duration as StdDuration};
+use tokio::time::sleep;
 
 use chrono::{Duration, Local};
+
+fn read_cgroup(pid: u32) -> String {
+    fs::read_to_string(format!("/proc/{}/cgroup", pid))
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn read_cmdline(pid: u32) -> String {
+    fs::read_to_string(format!("/proc/{}/cmdline", pid))
+        .unwrap_or_default()
+        .replace("\0", " ")
+        .trim()
+        .to_string()
+}
+
+pub fn take_real_snapshot() -> AnyResult<ProcessSnapshot> {
+    let mut snapshot = ProcessSnapshot::new();
+    for entry in procfs::process::all_processes().unwrap() {
+        let Ok(proc) = entry else { continue };
+        let Ok(status) = proc.status() else { continue };
+        let Ok(stat) = proc.stat() else { continue };
+        let cmdline = read_cmdline(proc.pid() as u32);
+        let cgroup = read_cgroup(proc.pid() as u32);
+
+        snapshot.add_process(ProcessInfo::new(
+            proc.pid() as u32,
+            stat.utime,
+            stat.stime,
+            cmdline,
+            stat.comm,
+            status.ruid,
+            cgroup,
+        ));
+    }
+    Ok(snapshot)
+}
 
 #[derive(Debug, Clone)]
 pub struct MonitorError {
@@ -57,6 +98,42 @@ impl CpuMonitor {
     }
     pub fn total_cpu_seconds(&self) -> f64 {
         self.group_totals.values().sum()
+    }
+
+    pub async fn prod_run(&mut self) -> AnyResult<MonitorReport> {
+        let start = Local::now();
+        self.started_at = Some(start.clone().to_rfc3339());
+        self.group_totals = HashMap::new();
+        self.total_samples = 0;
+        let clk_tck = procfs::ticks_per_second();
+        let duration = Duration::hours(self.duration_hours as i64);
+        println!(
+            "📡 Monitoring started as {} for {} hours",
+            start.clone(),
+            self.duration_hours.clone()
+        );
+        let mut prev = take_real_snapshot()?;
+        loop {
+            sleep(StdDuration::from_secs(self.interval as u64)).await;
+            if Local::now() - start < duration {
+                break;
+            }
+            let curr = match take_real_snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("⚠️ Snapshot error: {}", e);
+                    continue;
+                }
+            };
+            let deltas = curr.calculate_classified_deltas(&prev, clk_tck);
+            let aggregated = ProcessSnapshot::aggregate_by_group(&deltas);
+            for (group, cpu_secs) in aggregated {
+                *self.group_totals.entry(group.clone()).or_insert(0.0) += cpu_secs;
+            }
+            self.total_samples += 1;
+            prev = curr;
+        }
+        Ok(self.generate_report())
     }
 
     pub fn run<P: ProcessSnaphotProvider>(

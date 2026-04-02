@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
     let mut monitor = CpuMonitor::new(args.duration, args.interval);
 
     // Запуск мониторинга
-    let report = monitor.run().await?;
+    let report = monitor.prod_run().await?;
 
     // Сохранение отчёта
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
