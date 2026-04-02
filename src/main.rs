@@ -11,7 +11,7 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 #[command(author, version, about = "24-hour CPU monitor for all host processes")]
 struct Args {
     /// Room ID для отправки отчёта
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "")]
     room_id: String,
 
     /// Интервал опроса в секундах
@@ -21,10 +21,6 @@ struct Args {
     /// Длительность мониторинга в часах
     #[arg(long, default_value = "24")]
     duration: u8,
-
-    /// Паттерн для GitLab-процессов
-    #[arg(long, default_value = "gitlab")]
-    gitlab_pattern: String,
 
     /// URL для отправки отчёта
     #[arg(long, default_value = "http://10.10.0.1:9099/send-file-image")]
@@ -79,23 +75,25 @@ async fn main() -> Result<()> {
 
     let mut monitor = CpuMonitor::new(args.duration, args.interval);
 
-    // Запуск мониторинга
+    // Запуск мониторингo
     let report = monitor.prod_run().await?;
 
     // Сохранение отчёта
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     let report_file = format!("cpu_report_{}.json", timestamp);
 
-    save_report(&report, &report_file).await;
+    let _ = save_report(&report, &report_file).await;
 
     // Отправка
     println!("📤 Sending report...");
-    send_report(
-        args.webhook_url.clone(),
-        args.room_id.clone(),
-        report_file.to_string().clone(),
-    )
-    .await?;
+    if !args.room_id.is_empty() {
+        send_report(
+            args.webhook_url.clone(),
+            args.room_id.clone(),
+            report_file.to_string().clone(),
+        )
+        .await?;
+    }
 
     println!("🏁 Done. Exiting.");
     Ok(())
