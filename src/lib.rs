@@ -1,6 +1,7 @@
 use anyhow::Result as AnyResult;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, error::Error, fmt, fs, time::Duration as StdDuration};
+use std::{collections::HashMap, error::Error, fmt, fs, sync::Arc, time::Duration as StdDuration};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use chrono::{Duration, Local};
@@ -63,12 +64,49 @@ pub struct MonitorReport {
     pub total_samples: usize,
     pub started_at: String,
     pub finished_at: String,
-    pub groups: HashMap<String, f64>,
-    pub top_consumers: Vec<(String, f64)>,
+    pub groups: Vec<(String, f64)>,
 }
 
 pub trait ProcessSnaphotProvider {
     fn take_snapshot(&self) -> Result<ProcessSnapshot, MonitorError>;
+}
+
+#[derive(Clone)]
+pub struct MonitorState {
+    pub group_totals: Arc<Mutex<HashMap<String, f64>>>,
+    pub total_samples: Arc<Mutex<usize>>,
+    pub started_at: Arc<Mutex<Option<String>>>,
+    pub duration_hours: u8,
+}
+
+impl MonitorState {
+    pub fn new(duration_hours: u8) -> Self {
+        Self {
+            group_totals: Arc::new(Mutex::new(HashMap::new())),
+            total_samples: Arc::new(Mutex::new(0)),
+            started_at: Arc::new(Mutex::new(None)),
+            duration_hours,
+        }
+    }
+
+    pub async fn generate_report(&self) -> MonitorReport {
+        let mut groups: Vec<(String, f64)> = self.group_totals.lock().await.iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        groups.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        MonitorReport {
+            duration_hours: self.duration_hours,
+            total_samples: *self.total_samples.lock().await,
+            started_at: self
+                .started_at
+                .lock()
+                .await
+                .clone()
+                .unwrap_or_else(|| Local::now().to_rfc3339()),
+            finished_at: Local::now().to_rfc3339(),
+            groups,
+        }
+    }
 }
 
 pub struct CpuMonitor {
@@ -115,7 +153,7 @@ impl CpuMonitor {
         let mut prev = take_real_snapshot()?;
         loop {
             sleep(StdDuration::from_secs(self.interval as u64)).await;
-            if Local::now() - start < duration {
+            if Local::now() - start >= duration {
                 break;
             }
             let curr = match take_real_snapshot() {
@@ -134,6 +172,64 @@ impl CpuMonitor {
             prev = curr;
         }
         Ok(self.generate_report())
+    }
+
+    pub async fn prod_run_with_signal(&mut self) -> AnyResult<MonitorReport> {
+        use tokio::signal;
+
+        let state = MonitorState::new(self.duration_hours);
+        let state_clone = state.clone();
+
+        tokio::spawn(async move {
+            signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
+            println!("\n⚠️  Interrupted! Generating report...");
+            let report = state_clone.generate_report().await;
+            let data = serde_json::to_string_pretty(&report).unwrap_or_default();
+            let filename = format!(
+                "cpu_report_interrupted_{}.json",
+                Local::now().format("%Y%m%d_%H%M%S")
+            );
+            std::fs::write(&filename, data).unwrap_or_default();
+            println!("📄 Partial report saved: {}", filename);
+            std::process::exit(0);
+        });
+
+        let start = Local::now();
+        *state.started_at.lock().await = Some(start.clone().to_rfc3339());
+        let clk_tck = procfs::ticks_per_second();
+        let duration = Duration::hours(self.duration_hours as i64);
+        println!(
+            "📡 Monitoring started as {} for {} hours",
+            start.clone(),
+            self.duration_hours.clone()
+        );
+        let mut prev = take_real_snapshot()?;
+
+        loop {
+            sleep(StdDuration::from_secs(self.interval as u64)).await;
+            if Local::now() - start >= duration {
+                break;
+            }
+            let curr = match take_real_snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("⚠️ Snapshot error: {}", e);
+                    continue;
+                }
+            };
+            let deltas = curr.calculate_classified_deltas(&prev, clk_tck);
+            let aggregated = ProcessSnapshot::aggregate_by_group(&deltas);
+            {
+                let mut group_totals = state.group_totals.lock().await;
+                for (group, cpu_secs) in aggregated {
+                    *group_totals.entry(group.clone()).or_insert(0.0) += cpu_secs;
+                }
+            }
+            *state.total_samples.lock().await += 1;
+            prev = curr;
+        }
+
+        Ok(state.generate_report().await)
     }
 
     pub fn run<P: ProcessSnaphotProvider>(
@@ -186,12 +282,10 @@ impl CpuMonitor {
         Ok(Some(curr_snapshot))
     }
     pub fn generate_report(&self) -> MonitorReport {
-        let mut sorted: Vec<(String, f64)> = self
-            .group_totals
-            .iter()
+        let mut groups: Vec<(String, f64)> = self.group_totals.iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        groups.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         MonitorReport {
             duration_hours: self.duration_hours,
             total_samples: self.total_samples,
@@ -200,8 +294,7 @@ impl CpuMonitor {
                 .clone()
                 .unwrap_or_else(|| Local::now().to_rfc3339()),
             finished_at: Local::now().to_rfc3339(),
-            groups: self.group_totals.clone(),
-            top_consumers: sorted,
+            groups,
         }
     }
 }
@@ -256,13 +349,14 @@ impl ProcessSnapshot {
                 && let Some(delta_sec) = cur_process.cpu_delta_seconds(prev_process, clk_tck)
                 && delta_sec > 0.0
             {
-                let group = classify_proccess(&cur_process.cmdline, &cur_process.comm);
+                let group =
+                    classify_proccess(&cur_process.cmdline, &cur_process.comm, &cur_process.cgroup);
                 deltas.push(ProcessDelta {
                     pid: *pid,
                     group,
                     cpu_seconds: delta_sec,
                     cmdline: cur_process.cmdline.clone(),
-                    cgroup: cur_process.comm.clone(),
+                    cgroup: cur_process.cgroup.clone(),
                 });
             }
         }
@@ -273,7 +367,7 @@ impl ProcessSnapshot {
         let mut groups = HashMap::new();
         for delta in deltas {
             *groups
-                .entry(delta.group.converte(delta.cmdline.clone()))
+                .entry(delta.group.converte(delta.cgroup.clone()))
                 .or_insert(0.0) += delta.cpu_seconds;
         }
         groups
@@ -366,9 +460,31 @@ impl fmt::Display for ProcessType {
 impl ProcessType {
     pub fn converte(&self, comm: String) -> String {
         match self {
-            ProcessType::Proc | ProcessType::Suspicious => format!("{}:{}", self, comm),
+            ProcessType::Proc | ProcessType::Suspicious => {
+                // Извлекаем короткое имя сервиса из cgroup пути
+                let short_name = Self::extract_service_name(&comm);
+                format!("{}:{}", self, short_name)
+            }
             _ => self.to_string(),
         }
+    }
+
+    pub(crate) fn extract_service_name(cgroup: &str) -> String {
+        if cgroup.is_empty() || cgroup == "0::/" {
+            return "kernel".to_string();
+        }
+        // Извлекаем последнее компонент пути
+        if let Some(last_part) = cgroup.split('/').last() {
+            if !last_part.is_empty() {
+                // Убираем .scope, .service и т.д.
+                return last_part
+                    .trim_end_matches(".scope")
+                    .trim_end_matches(".service")
+                    .trim_end_matches(".slice")
+                    .to_string();
+            }
+        }
+        "unknown".to_string()
     }
     pub fn from_cmdline_and_comm(cmdline: &str, comm: &str) -> Self {
         const PATTERNS: &[(&str, ProcessType)] = &[
@@ -392,6 +508,24 @@ impl ProcessType {
         }
         Self::Proc
     }
+
+    pub fn from_cgroup(cgroup: &str) -> Option<Self> {
+        let cgroup_lower = cgroup.to_lowercase();
+        if cgroup_lower.contains("docker-") || cgroup_lower.contains("/docker/") {
+            return Some(ProcessType::Docker);
+        }
+        if cgroup_lower.contains("gitlab") {
+            return Some(ProcessType::Gitlab);
+        }
+        // Корневой cgroup — это kernel threads
+        if cgroup_lower == "0::/" {
+            return Some(ProcessType::System);
+        }
+        if cgroup_lower.contains("/system.slice/") && !cgroup_lower.contains("user.slice") {
+            return Some(ProcessType::System);
+        }
+        None
+    }
 }
 
 fn ticks_to_seconds(ticks: u64, clk_tck: u64) -> f64 {
@@ -401,9 +535,16 @@ fn ticks_to_seconds(ticks: u64, clk_tck: u64) -> f64 {
     ticks as f64 / clk_tck as f64
 }
 
-fn classify_proccess(cmdline: &str, comm: &str) -> ProcessType {
+fn classify_proccess(cmdline: &str, comm: &str, cgroup: &str) -> ProcessType {
     let cmdline = cmdline.to_lowercase();
     let comm = comm.to_lowercase();
+
+    // Сначала проверяем cgroup для Docker/System/Gitlab
+    if let Some(process_type) = ProcessType::from_cgroup(cgroup) {
+        return process_type;
+    }
+
+    // Затем проверяем по имени процесса
     ProcessType::from_cmdline_and_comm(&cmdline, &comm)
 }
 
@@ -482,11 +623,9 @@ mod tests {
         println!("Groups: {:?}", report.groups);
 
         assert_eq!(report.total_samples, 3);
-        assert!(report.groups.contains_key(&ProcessType::Gitlab.to_string()));
-        assert_eq!(
-            report.groups.get(&ProcessType::Gitlab.to_string()),
-            Some(&3.0)
-        );
+        let gitlab_entry = report.groups.iter().find(|(k, _)| k.contains("Gitlab"));
+        assert!(gitlab_entry.is_some());
+        assert_eq!(gitlab_entry.map(|(_, v)| v), Some(&3.0));
     }
 
     #[test]
@@ -502,7 +641,7 @@ mod tests {
             "/gitlab".into(),
             "gitlab".into(),
             1000,
-            "".into(),
+            "gitlab".into(),
         ));
         prev.add_process(ProcessInfo::new(
             2,
@@ -511,7 +650,7 @@ mod tests {
             "/nginx".into(),
             "nginx".into(),
             1000,
-            "".into(),
+            "nginx".into(),
         ));
 
         let mut curr = ProcessSnapshot::new();
@@ -522,7 +661,7 @@ mod tests {
             "/gitlab".into(),
             "gitlab".into(),
             1000,
-            "".into(),
+            "gitlab".into(),
         ));
         curr.add_process(ProcessInfo::new(
             2,
@@ -531,7 +670,7 @@ mod tests {
             "/nginx".into(),
             "nginx".into(),
             1000,
-            "".into(),
+            "nginx".into(),
         ));
 
         let provider = MockSnapshotProvider::new(vec![curr]);
@@ -547,7 +686,7 @@ mod tests {
         assert_eq!(
             monitor
                 .group_totals
-                .get(&ProcessType::Proc.converte("/nginx".to_string())),
+                .get(&ProcessType::Proc.converte("nginx".to_string())),
             Some(&1.5)
         );
         assert_eq!(monitor.total_samples, 1);
@@ -598,7 +737,7 @@ mod tests {
                 group: ProcessType::Proc,
                 cpu_seconds: 5.0,
                 cmdline: "/test".into(),
-                cgroup: "".into(),
+                cgroup: "test".into(),
             },
         ];
 
@@ -610,8 +749,26 @@ mod tests {
             Some(&30.0)
         );
         assert_eq!(
-            aggregated.get(&format!("{}:{}", &ProcessType::Proc, "/test")),
+            aggregated.get(&format!("{}:{}", &ProcessType::Proc, "test")),
             Some(&5.0)
+        );
+    }
+
+    #[test]
+    fn test_extract_service_name() {
+        assert_eq!(ProcessType::extract_service_name(""), "kernel");
+        assert_eq!(ProcessType::extract_service_name("0::/"), "kernel");
+        assert_eq!(
+            ProcessType::extract_service_name("/system.slice/docker-abc123.scope"),
+            "docker-abc123"
+        );
+        assert_eq!(
+            ProcessType::extract_service_name("/system.slice/NetworkManager.service"),
+            "NetworkManager"
+        );
+        assert_eq!(
+            ProcessType::extract_service_name("/user.slice/app.slice/my-app.scope"),
+            "my-app"
         );
     }
 
@@ -965,37 +1122,64 @@ mod tests {
 
     #[test]
     fn test_classify_proccess_gitlab_runner() {
-        let result = classify_proccess("/usr/bin/gitlab-runner build --job=123", "gitlab-runner");
+        let result = classify_proccess(
+            "/usr/bin/gitlab-runner build --job=123",
+            "gitlab-runner",
+            "",
+        );
         assert_eq!(result, ProcessType::Gitlab);
     }
     #[test]
     fn test_classify_proccess_gitlab_runner_by_cmdline() {
-        let result = classify_proccess("/usr/bin/script", "gitlab-runner");
+        let result = classify_proccess("/usr/bin/script", "gitlab-runner", "");
         assert_eq!(result, ProcessType::Gitlab);
     }
 
     #[test]
     fn test_classify_proccess_run_from_tmp() {
-        let result = classify_proccess("/tmp/xmrig --pool=xyz", "xmrig");
+        let result = classify_proccess("/tmp/xmrig --pool=xyz", "xmrig", "");
         assert_eq!(result, ProcessType::Suspicious);
     }
 
     #[test]
     fn test_classify_proccess_docker_infra() {
-        let result = classify_proccess("/user/bin/containerd-shim-runc-v2", "containerd-shim");
+        let result = classify_proccess("/user/bin/containerd-shim-runc-v2", "containerd-shim", "");
         assert_eq!(result, ProcessType::Docker);
     }
 
     #[test]
     fn test_classify_proccess_regular() {
-        let result = classify_proccess("/user/bin/nginx -g daemon off", "nginx");
+        let result = classify_proccess("/user/bin/nginx -g daemon off", "nginx", "");
         assert_eq!(result, ProcessType::Proc);
     }
 
     #[test]
     fn test_classify_proccess_system() {
-        let result = classify_proccess("/sbin/init", "systemd");
+        let result = classify_proccess("/sbin/init", "systemd", "");
         assert_eq!(result, ProcessType::System);
+    }
+
+    #[test]
+    fn test_classify_proccess_docker_by_cgroup() {
+        let result = classify_proccess("/usr/bin/app", "app", "/system.slice/docker-abc123.scope");
+        assert_eq!(result, ProcessType::Docker);
+    }
+
+    #[test]
+    fn test_classify_proccess_system_by_cgroup() {
+        let result = classify_proccess(
+            "/usr/bin/some-daemon",
+            "some-daemon",
+            "/system.slice/NetworkManager.service",
+        );
+        assert_eq!(result, ProcessType::System);
+    }
+
+    #[test]
+    fn test_classify_proccess_gitlab_by_cgroup() {
+        let result =
+            classify_proccess("/usr/bin/app", "app", "/system.slice/gitlab-runner.service");
+        assert_eq!(result, ProcessType::Gitlab);
     }
 
     #[test]

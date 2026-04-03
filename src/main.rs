@@ -15,7 +15,7 @@ struct Args {
     room_id: String,
 
     /// Интервал опроса в секундах
-    #[arg(short, long, default_value = "30")]
+    #[arg(short, long, default_value = "10")]
     interval: u16,
 
     /// Длительность мониторинга в часах
@@ -75,8 +75,8 @@ async fn main() -> Result<()> {
 
     let mut monitor = CpuMonitor::new(args.duration, args.interval);
 
-    // Запуск мониторингo
-    let report = monitor.prod_run().await?;
+    // Запуск мониторингa
+    let report = monitor.prod_run_with_signal().await?;
 
     // Сохранение отчёта
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
